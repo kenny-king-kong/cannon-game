@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chalkboard Cannon — Demolition</title>
+<link href="https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Gochi+Hand&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --board:#2b3a34;
+    --board-deep:#22302b;
+    --chalk:#ece7da;
+    --chalk-dim:rgba(236,231,218,.55);
+    --yellow:#f2d06b;
+    --wood:#8a5a3b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--board-deep);
+    font-family:'Patrick Hand','Comic Sans MS',cursive;
+    color:var(--chalk);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:100vh;padding:10px;
+  }
+  .frame{
+    width:min(1560px,100%);
+    border:10px solid var(--wood);
+    border-radius:8px;
+    box-shadow:0 12px 40px rgba(0,0,0,.5), inset 0 0 60px rgba(0,0,0,.35);
+    background:var(--board);
+    position:relative;
+    overflow:hidden;
+  }
+  canvas{display:block;width:100%;height:auto;touch-action:none;cursor:crosshair}
+  .tray{
+    width:min(1560px,100%);
+    display:flex;justify-content:space-between;align-items:center;
+    padding:8px 6px 0;font-size:18px;color:var(--chalk-dim);
+  }
+  .tray button{
+    font-family:inherit;font-size:17px;color:var(--chalk);
+    background:transparent;border:2px dashed var(--chalk-dim);
+    border-radius:8px;padding:3px 14px;cursor:pointer;
+  }
+  .tray button:hover{border-color:var(--chalk);color:var(--yellow)}
+  .tray button:focus-visible{outline:2px solid var(--yellow);outline-offset:2px}
+</style>
+</head>
+<body>
+  <div class="frame"><canvas id="c" width="1800" height="1200"></canvas></div>
+  <div class="tray">
+    <span>move to aim · hold to fire 10 balls / sec · demolish the buildings &amp; bridges, sweep the debris into the hole</span>
+    <button id="reset">new city</button>
+  </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+const { Engine, Bodies, Body, Composite, Events } = Matter;
+
+const W = 1800, H = 1200;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const engine = Engine.create();
+engine.gravity.y = 1;
+const world = engine.world;
+
+/* ---------- palette ---------- */
+const CHALK = '#ece7da', DIM = 'rgba(236,231,218,.5)',
+      YELLOW = '#f2d06b', BLUE = '#9fc3d6', PEACH = '#e8946a';
+
+/* ---------- static level: one floor + one incline to the hole ---------- */
+const wallOpts = { isStatic:true, restitution:.6, friction:.05 };
+function ground(x,y,w,h,angle=0,label='wall'){
+  const b = Bodies.rectangle(x,y,w,h,{...wallOpts, angle, label});
+  b.w=w; b.h=h;
+  Composite.add(world,b);
+  return b;
+}
+
+const FLOOR_Y = 1000;                       // top of the flat floor
+ground(575, 1050, 1154, 100);               // flat floor, x 0→1152
+ground(1356, 1066, 422, 40, 0.215, 'incline'); // incline down to the hole
+ground(1726, 1100, 148, 60);                // ledge past the hole (its left face is the hole wall)
+ground(145, 800, 260, 460, 0);              // tall cannon tower, top ≈ 570
+/* boundaries */
+ground(900, -12, 1800, 24);
+ground(-12, 600, 24, 1200);
+ground(1812, 600, 24, 1200);
+
+/* hole */
+const HOLE_L = 1562, HOLE_R = 1652;
+const holeSensor = Bodies.rectangle((HOLE_L+HOLE_R)/2, 1290, HOLE_R-HOLE_L+60, 70,
+  { isStatic:true, isSensor:true, label:'hole' });
+Composite.add(world, holeSensor);
+
+/* ---------- destructible city: buildings & bridges ---------- */
+const BRICK_R = 15;
+let bricks = [];
+let nextSid = 1;
+
+function addRectBrick(x,y,w,h,sid){
+  const b = Bodies.rectangle(x,y,w,h,{
+    isStatic:true, restitution:.1, friction:.3, label:'brick'
+  });
+  b.frozen = true; b.sid = sid; b.kind='rect'; b.bw=w; b.bh=h;
+  bricks.push(b); Composite.add(world,b);
+}
+function addBallBrick(x,y,sid){
+  const b = Bodies.circle(x,y,BRICK_R,{
+    isStatic:true, restitution:.35, friction:.02, frictionAir:.008, label:'brick'
+  });
+  b.frozen = true; b.sid = sid; b.kind='ball';
+  bricks.push(b); Composite.add(world,b);
+}
+
+function building(bx){
+  const sid = nextSid++;
+  const storyW = 100 + Math.random()*50;
+  const stories = 2 + Math.floor(Math.random()*3);      // 2–4 stories
+  let cur = FLOOR_Y;
+  for(let s=0; s<stories; s++){
+    const pillarH = 80 + Math.random()*30;
+    addRectBrick(bx - storyW/2, cur - pillarH/2, 16, pillarH, sid);
+    addRectBrick(bx + storyW/2, cur - pillarH/2, 16, pillarH, sid);
+    addRectBrick(bx, cur - pillarH - 7, storyW + 54, 14, sid);
+    cur -= pillarH + 14;
+  }
+  addBallBrick(bx, cur - BRICK_R - 1, sid);             // ball on the roof
+  return storyW/2 + 45;
+}
+
+function bridge(bx){
+  const sid = nextSid++;
+  const span = 200 + Math.random()*80;
+  const pillarH = 100 + Math.random()*40;
+  addRectBrick(bx - span/2, FLOOR_Y - pillarH/2, 18, pillarH, sid);
+  addRectBrick(bx + span/2, FLOOR_Y - pillarH/2, 18, pillarH, sid);
+  addRectBrick(bx, FLOOR_Y - pillarH - 8, span + 70, 16, sid);   // deck
+  const n = 2 + Math.floor(Math.random()*2);            // cargo on the deck
+  for(let i=0;i<n;i++){
+    addBallBrick(bx - (n-1)*(BRICK_R+2) + i*(BRICK_R*2+4), FLOOR_Y - pillarH - 16 - BRICK_R, sid);
+  }
+  return span/2 + 55;
+}
+
+function spawnCity(){
+  bricks.forEach(b => Composite.remove(world, b));
+  bricks = [];
+  const placed = [];                                     // [x, halfWidth]
+  function tryPlace(min,max,maker,count){
+    let made = 0, tries = 0;
+    while(made < count && tries++ < 120){
+      const x = min + Math.random()*(max-min);
+      if(placed.every(([px,pw]) => Math.abs(px-x) > pw + 150)) {
+        const hw = maker(x);
+        placed.push([x,hw]);
+        made++;
+      }
+    }
+  }
+  tryPlace(560, 1000, building, 2 + Math.floor(Math.random()*2));  // 2–3 buildings
+  tryPlace(1030, 1340, bridge, 1 + Math.floor(Math.random()*2));   // 1–2 bridges
+}
+
+/* waking: a hit brings its whole structure to life */
+function wakeStructure(sid){
+  for(const b of bricks){
+    if(b.sid === sid && b.frozen){
+      b.frozen = false;
+      Body.setStatic(b, false);
+    }
+  }
+}
+
+/* ---------- cannon, perched on the tower's front edge ---------- */
+const cannon = { x:268, y:538, angle:0.15, len:78, w:28 };
+let firing = false, fireAcc = 0;
+const FIRE_INTERVAL = 1000/10;             // 10 balls per second
+const POWER = 34;                          // always full power
+let score = 0, shots = 0, clearedAt = 0;
+const balls = [], popups = [], puffs = [], ghosts = [];
+
+function fire(){
+  shots++;
+  const tipX = cannon.x + Math.cos(cannon.angle)*(cannon.len+18);
+  const tipY = cannon.y + Math.sin(cannon.angle)*(cannon.len+18);
+  const b = Bodies.circle(tipX, tipY, 12, {
+    restitution:.72, friction:.008, frictionAir:.005, label:'ball'
+  });
+  b.born = performance.now(); b.slowMs = 0;
+  Body.setVelocity(b, { x:Math.cos(cannon.angle)*POWER, y:Math.sin(cannon.angle)*POWER });
+  Composite.add(world, b);
+  balls.push(b);
+  puffs.push({x:tipX, y:tipY, t:0});
+  if(balls.length > 150){ Composite.remove(world, balls.shift()); }
+}
+
+/* ---------- input ---------- */
+function canvasPos(e){
+  const r = canvas.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height };
+}
+function aim(p){
+  const a = Math.atan2(p.y-cannon.y, p.x-cannon.x);
+  cannon.angle = Math.max(-1.45, Math.min(0.95, a));   // can fire well downward from the tower
+}
+canvas.addEventListener('pointermove', e => aim(canvasPos(e)));
+canvas.addEventListener('pointerdown', e => {
+  aim(canvasPos(e));
+  firing = true; fire(); fireAcc = 0;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointerup',     () => firing = false);
+canvas.addEventListener('pointercancel', () => firing = false);
+document.getElementById('reset').addEventListener('click', () => {
+  balls.forEach(b => Composite.remove(world,b));
+  balls.length = 0; score = 0; shots = 0; clearedAt = 0;
+  spawnCity();
+});
+
+/* ---------- collisions: score sinks, wake structures ---------- */
+Events.on(engine, 'collisionStart', ev => {
+  for(const pair of ev.pairs){
+    const a = pair.bodyA, b = pair.bodyB;
+    if(a.label==='hole' || b.label==='hole'){
+      const body = a.label==='hole' ? b : a;
+      if(body.label==='ball' || body.label==='brick'){
+        Composite.remove(world, body);
+        const arr = body.label==='ball' ? balls : bricks;
+        const i = arr.indexOf(body); if(i>-1) arr.splice(i,1);
+        score += body.label==='brick' ? 5 : 1;
+        popups.push({x:(HOLE_L+HOLE_R)/2, y:1140, t:0,
+                     txt: body.label==='brick' ? '+5' : '+1'});
+        if(bricks.length===0 && !clearedAt) clearedAt = performance.now();
+      }
+      continue;
+    }
+    if(a.label==='brick' && a.frozen && (b.label==='ball' || (b.label==='brick' && !b.frozen))) wakeStructure(a.sid);
+    if(b.label==='brick' && b.frozen && (a.label==='ball' || (a.label==='brick' && !a.frozen))) wakeStructure(b.sid);
+  }
+});
+
+/* ---------- chalk helpers ---------- */
+function chalkRect(b){
+  ctx.save();
+  ctx.translate(b.position.x, b.position.y);
+  ctx.rotate(b.angle);
+  ctx.fillStyle = 'rgba(236,231,218,.07)';
+  ctx.fillRect(-b.w/2, -b.h/2, b.w, b.h);
+  ctx.strokeStyle = CHALK;
+  ctx.lineWidth = 2.5;
+  ctx.strokeRect(-b.w/2, -b.h/2, b.w, b.h);
+  ctx.strokeStyle = 'rgba(236,231,218,.25)';
+  ctx.lineWidth = 5;
+  ctx.strokeRect(-b.w/2+1.5, -b.h/2+1.5, b.w-3, b.h-3);
+  ctx.strokeStyle = 'rgba(236,231,218,.18)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const step = 16;
+  for(let x=-b.w/2+6; x<b.w/2; x+=step){
+    ctx.moveTo(x, -b.h/2+3);
+    ctx.lineTo(Math.min(x+b.h*0.6, b.w/2-3), Math.min(-b.h/2+3+b.h*0.6, b.h/2-3));
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBall(b){
+  ctx.save();
+  ctx.translate(b.position.x, b.position.y);
+  ctx.rotate(b.angle);
+  ctx.fillStyle = PEACH;
+  ctx.beginPath(); ctx.arc(0,0,12,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(43,58,52,.55)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-9,0); ctx.lineTo(9,0); ctx.stroke();
+  ctx.strokeStyle = 'rgba(236,231,218,.7)';
+  ctx.beginPath(); ctx.arc(-4,-4,4.5,Math.PI, Math.PI*1.6); ctx.stroke();
+  ctx.restore();
+}
+
+function drawBrick(b){
+  ctx.save();
+  ctx.translate(b.position.x, b.position.y);
+  ctx.rotate(b.angle);
+  if(b.kind === 'rect'){
+    if(b.frozen){
+      ctx.fillStyle = 'rgba(159,195,214,.18)';
+      ctx.fillRect(-b.bw/2,-b.bh/2,b.bw,b.bh);
+      ctx.strokeStyle = BLUE; ctx.lineWidth = 2.5;
+      ctx.setLineDash([7,6]);
+      ctx.strokeRect(-b.bw/2,-b.bh/2,b.bw,b.bh);
+      ctx.setLineDash([]);
+    }else{
+      ctx.fillStyle = 'rgba(159,195,214,.55)';
+      ctx.fillRect(-b.bw/2,-b.bh/2,b.bw,b.bh);
+      ctx.strokeStyle = BLUE; ctx.lineWidth = 2.5;
+      ctx.strokeRect(-b.bw/2,-b.bh/2,b.bw,b.bh);
+    }
+  }else{
+    if(b.frozen){
+      ctx.fillStyle = 'rgba(159,195,214,.30)';
+      ctx.beginPath(); ctx.arc(0,0,BRICK_R,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle = BLUE; ctx.lineWidth = 2.5;
+      ctx.setLineDash([6,5]);
+      ctx.beginPath(); ctx.arc(0,0,BRICK_R,0,Math.PI*2); ctx.stroke();
+      ctx.setLineDash([]);
+    }else{
+      ctx.fillStyle = BLUE;
+      ctx.beginPath(); ctx.arc(0,0,BRICK_R,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(43,58,52,.55)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(-11,0); ctx.lineTo(11,0); ctx.stroke();
+      ctx.strokeStyle = 'rgba(236,231,218,.8)';
+      ctx.beginPath(); ctx.arc(-5,-5,5,Math.PI, Math.PI*1.6); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawCannon(){
+  ctx.save();
+  ctx.translate(cannon.x, cannon.y);
+  ctx.save();
+  ctx.rotate(cannon.angle);
+  ctx.fillStyle = 'rgba(236,231,218,.12)';
+  ctx.strokeStyle = CHALK; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(-18, -cannon.w/2, cannon.len+24, cannon.w, 8);
+  ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = 'rgba(236,231,218,.4)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cannon.len-6,-cannon.w/2); ctx.lineTo(cannon.len-6,cannon.w/2); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = 'rgba(236,231,218,.15)';
+  ctx.strokeStyle = CHALK; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0,6,26,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = DIM; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(0,22,15,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-15,22); ctx.lineTo(15,22);
+  ctx.moveTo(0,7); ctx.lineTo(0,37);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTrajectory(){
+  let px = cannon.x + Math.cos(cannon.angle)*(cannon.len+18);
+  let py = cannon.y + Math.sin(cannon.angle)*(cannon.len+18);
+  let vx = Math.cos(cannon.angle)*POWER, vy = Math.sin(cannon.angle)*POWER;
+  ctx.fillStyle = firing ? YELLOW : DIM;
+  for(let i=0;i<90;i++){
+    vx *= .995; vy = vy*.995 + .2777;
+    px += vx; py += vy;
+    if(i%3===0){
+      ctx.globalAlpha = Math.max(0, 1 - i/90);
+      ctx.beginPath(); ctx.arc(px,py, firing?3.4:2.6, 0, Math.PI*2); ctx.fill();
+    }
+    if(py > 1240) break;
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHole(){
+  ctx.fillStyle = '#141d19';
+  ctx.beginPath();
+  ctx.moveTo(HOLE_L, 1092); ctx.lineTo(HOLE_R, 1070);
+  ctx.lineTo(HOLE_R, 1200); ctx.lineTo(HOLE_L, 1200);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = YELLOW; ctx.lineWidth = 2.5; ctx.setLineDash([8,7]);
+  ctx.beginPath();
+  ctx.moveTo(HOLE_L-2, 1093); ctx.lineTo(HOLE_R+2, 1069);
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = YELLOW;
+  ctx.font = '28px "Gochi Hand", cursive';
+  ctx.textAlign = 'center';
+  ctx.fillText('the hole', 1607, 1000);
+  ctx.strokeStyle = YELLOW; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(1607, 1010); ctx.quadraticCurveTo(1600, 1030, 1607, 1050);
+  ctx.moveTo(1599, 1040); ctx.lineTo(1607, 1053); ctx.lineTo(1615, 1039);
+  ctx.stroke();
+}
+
+function drawHUD(){
+  ctx.textAlign = 'left';
+  ctx.font = '40px "Gochi Hand", cursive';
+  ctx.fillStyle = CHALK;
+  ctx.fillText('score: ' + score, 32, 56);
+  ctx.font = '24px "Patrick Hand", cursive';
+  ctx.fillStyle = DIM;
+  ctx.fillText('shots: ' + shots, 34, 88);
+  ctx.fillStyle = 'rgba(159,195,214,.9)';
+  ctx.fillText('debris left: ' + bricks.length + '   (worth +5 each)', 34, 118);
+
+  ctx.fillStyle = 'rgba(159,195,214,.75)';
+  ctx.font = '22px "Patrick Hand", cursive';
+  ctx.fillText('g = 9.8 m/s² ↓', 840, 70);
+
+  if(clearedAt){
+    ctx.textAlign = 'center';
+    ctx.font = '64px "Gochi Hand", cursive';
+    ctx.fillStyle = YELLOW;
+    ctx.fillText('city cleared!', W/2, 380);
+    ctx.font = '26px "Patrick Hand", cursive';
+    ctx.fillStyle = DIM;
+    ctx.fillText('a new city is being drawn…', W/2, 424);
+    ctx.textAlign = 'left';
+  }
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(now-last, 33); last = now;
+  if(firing){
+    fireAcc += dt;
+    while(fireAcc >= FIRE_INTERVAL){ fireAcc -= FIRE_INTERVAL; fire(); }
+  }
+  Engine.update(engine, 1000/60);
+
+  if(clearedAt && now - clearedAt > 2500){
+    clearedAt = 0;
+    spawnCity();
+  }
+
+  /* cull escapees, and dissolve spent ammo so it can't pile up and block shots */
+  for(let i=balls.length-1;i>=0;i--){
+    const b = balls[i];
+    if(b.position.y > 1450 || b.position.x < -80 || b.position.x > 1880){
+      Composite.remove(world,b); balls.splice(i,1); continue;
+    }
+    if(b.speed < 0.6) b.slowMs += dt; else b.slowMs = 0;
+    if(b.slowMs > 1400 || now - b.born > 15000){
+      ghosts.push({x:b.position.x, y:b.position.y, t:0});
+      Composite.remove(world,b); balls.splice(i,1);
+    }
+  }
+  for(let i=bricks.length-1;i>=0;i--){
+    const b = bricks[i];
+    if(b.position.y > 1450 || b.position.x < -80 || b.position.x > 1880){
+      Composite.remove(world,b); bricks.splice(i,1);
+      if(bricks.length===0 && !clearedAt) clearedAt = performance.now();
+    }
+  }
+
+  ctx.clearRect(0,0,W,H);
+
+  ctx.strokeStyle = 'rgba(236,231,218,.045)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for(let x=0;x<=W;x+=50){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+  for(let y=0;y<=H;y+=50){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+
+  Composite.allBodies(world).forEach(b => {
+    if(b.label==='wall' || b.label==='incline') chalkRect(b);
+  });
+  drawHole();
+  drawTrajectory();
+  bricks.forEach(drawBrick);
+  balls.forEach(drawBall);
+  drawCannon();
+  drawHUD();
+
+  for(let i=puffs.length-1;i>=0;i--){
+    const p = puffs[i]; p.t += dt/400;
+    if(p.t>1){ puffs.splice(i,1); continue; }
+    ctx.strokeStyle = `rgba(236,231,218,${.6*(1-p.t)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 7+p.t*28, 0, Math.PI*2); ctx.stroke();
+  }
+  /* spent ammo dissolving into chalk dust */
+  for(let i=ghosts.length-1;i>=0;i--){
+    const g = ghosts[i]; g.t += dt/500;
+    if(g.t>1){ ghosts.splice(i,1); continue; }
+    ctx.globalAlpha = .55*(1-g.t);
+    ctx.fillStyle = PEACH;
+    ctx.beginPath(); ctx.arc(g.x, g.y, 12*(1-g.t), 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = DIM; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(g.x, g.y, 12 + g.t*14, 0, Math.PI*2); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  for(let i=popups.length-1;i>=0;i--){
+    const p = popups[i]; p.t += dt/900;
+    if(p.t>1){ popups.splice(i,1); continue; }
+    ctx.globalAlpha = 1-p.t;
+    ctx.fillStyle = YELLOW;
+    ctx.font = '44px "Gochi Hand", cursive';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.txt || '+1', p.x, p.y - p.t*66);
+    ctx.globalAlpha = 1;
+  }
+
+  requestAnimationFrame(loop);
+}
+spawnCity();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
