@@ -4,7 +4,7 @@ A chalkboard-styled physics sandbox. Aim a cannon, tear down a procedurally
 generated city of buildings and bridges, then sweep the rubble down the incline
 into the hole.
 
-**Play it:** https://kenny-kong-facemo.github.io/cannon-game/
+**Play it:** https://kenny-king-kong.github.io/cannon-game/
 
 ## How to play
 
